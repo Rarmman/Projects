@@ -1,0 +1,224 @@
+# Installing dependencies
+!pip -q install transformers datasets faiss-cpu sentence-transformers evaluate rouge_score accelerate nltk --upgrade
+!pip -q install -U "google-genai==1.7.0" "chromadb==0.6.3"
+
+import os
+import json
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from google import genai
+from google.genai import types
+from google.api_core import retry
+from kaggle_secrets import UserSecretsClient
+import chromadb
+from chromadb import EmbeddingFunction, Documents, Embeddings
+import evaluate
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from IPython.display import Markdown
+
+# Loading the SQuAD dataset
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+import kagglehub
+path = kagglehub.dataset_download("stanfordu/stanford-question-answering-dataset")
+
+train_file = '/kaggle/input/stanford-question-answering-dataset/train-v1.1.json'
+dev_file = '/kaggle/input/stanford-question-answering-dataset/dev-v1.1.json'
+
+def load_data(file_path, max_samples=None):
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    records = []
+    for article in data['data']:
+        for paragraph in article['paragraphs']:
+            context = paragraph['context']
+            for qa in paragraph['qas']:
+                question = qa['question']
+                answers = {
+                    "text": [ans['text'] for ans in qa['answers']],
+                    "answer_start": [ans['answer_start'] for ans in qa['answers']],
+                }
+                records.append({
+                    "id": qa["id"],
+                    "title": article["title"],
+                    "context": context,
+                    "question": question,
+                    "answers": answers,
+                })
+                if max_samples and len(records) >= max_samples:
+                    return records
+    return records
+
+max_samples = 41666
+train_data = load_data(train_file, max_samples=max_samples)
+dev_data = load_data(dev_file, max_samples=max_samples)
+print(f"Loaded {len(train_data)} training and {len(dev_data)} validation samples.")
+
+# Gemini + Chroma Setup
+GOOGLE_API_KEY = UserSecretsClient().get_secret("GOOGLE_API_KEY")
+client = genai.Client(api_key=GOOGLE_API_KEY)
+
+# Showing available embedding models
+for m in client.models.list():
+    if "embedContent" in m.supported_actions:
+        print("Embedding model:", m.name)
+
+# Embedding utilities
+def get_embeddings(texts):
+    response = client.models.embed_content(
+        model="models/text-embedding-004",
+        contents=texts,
+        config=types.EmbedContentConfig(task_type='semantic_similarity')
+    )
+    return response.embeddings
+
+def chunk_texts(texts, chunk_size=100):
+    for i in range(0, len(texts), chunk_size):
+        yield texts[i:i + chunk_size]
+
+def chunk_and_embed(texts, chunk_size=100):
+    embeddings = []
+    for i, chunk in enumerate(tqdm(chunk_texts(texts, chunk_size), desc="Embedding documents", unit="chunk")):
+        embeddings.extend(get_embeddings(chunk))
+    return embeddings
+
+passages = [record['context'] for record in train_data]
+
+# Defining embedding function for Chroma
+is_retriable = lambda e: isinstance(e, genai.errors.APIError) and e.code in {429, 503}
+
+class GeminiEmbeddingFunction(EmbeddingFunction):
+    def __init__(self, document_mode=True, batch_size=100):
+        self.document_mode = document_mode
+        self.batch = batch_size
+
+    @retry.Retry(predicate=is_retriable)
+    def __call__(self, inputs: Documents) -> Embeddings:
+        task = "retrieval_document" if self.document_mode else "retrieval_query"
+        vectors = []
+        for start in range(0, len(inputs), self.batch):
+            chunk = inputs[start:start + self.batch]
+            resp = client.models.embed_content(
+                model="models/text-embedding-004",
+                contents=chunk,
+                config=types.EmbedContentConfig(task_type=task),
+            )
+            vectors.extend([e.values for e in resp.embeddings])
+        return vectors
+
+# Creating database
+DB_NAME = "googlecardb"
+embed_fn = GeminiEmbeddingFunction(document_mode=True)
+chroma_client = chromadb.Client()
+db = chroma_client.get_or_create_collection(name=DB_NAME, embedding_function=embed_fn)
+
+print("Adding documents to Chroma...")
+db.add(documents=passages, ids=[str(i) for i in range(len(passages))])
+print("Chroma index ready.")
+
+# Training Phase (Simulated with Retrieval + Answer Generation)
+TOP_K = 3
+train_examples = train_data[:40000]
+training_prompts = []
+
+print("\nBuilding few-shot knowledge base samples (top-3 retrieval)...\n")
+for record in tqdm(train_examples):
+    question = record["question"]
+    result = db.query(query_texts=[question], n_results=TOP_K)
+    retrieved_passages = result["documents"][0] if result["documents"] else []
+    joined_passages = "\n\n".join([f"[Passage {i+1}]: {p}" for i, p in enumerate(retrieved_passages)])
+    prompt = f"""
+    You are an assistant answering questions strictly based on the following passages.
+    Provide a concise factual answer without adding external knowledge.
+    QUESTION: {question}
+    PASSAGES: {joined_passages}
+    """
+    training_prompts.append(prompt)
+
+print(f"Prepared {len(training_prompts)} training prompts with top-{TOP_K} retrieval.\n")
+
+# Evaluation Phase
+squad_metric = evaluate.load("squad")
+rouge = evaluate.load("rouge")
+bleu_metric = evaluate.load("bleu")
+
+embed_fn.document_mode = False
+db = chroma_client.get_collection(name=DB_NAME, embedding_function=embed_fn)
+
+predictions, references = [], []
+bleu_scores, rouge_scores, precision_scores, recall_scores = [], [], [], []
+
+print("\nEvaluating model on dev set with top-3 retrieval...\n")
+for sample in tqdm(dev_data[:5000], desc="Evaluating"):
+    question = sample['question']
+    ref_answer = sample['answers']['text'][0] if sample['answers']['text'] else ""
+    result = db.query(query_texts=[question], n_results=TOP_K)
+    retrieved_passages = result["documents"][0] if result["documents"] else []
+    passages_joined = "\n\n".join([f"[Passage {i+1}]: {p}" for i, p in enumerate(retrieved_passages)])
+    prompt = f"""
+    You are an assistant answering strictly based on the following passages.
+    Give a concise factual single-sentence answer only.
+    QUESTION: {question}
+    PASSAGES: {passages_joined}
+    """
+    try:
+        model_resp = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
+        pred_answer = model_resp.text.strip()
+    except Exception:
+        pred_answer = ""
+
+    predictions.append({"id": sample['id'], "prediction_text": pred_answer})
+    references.append({"id": sample['id'], "answers": sample['answers']})
+
+    if pred_answer and ref_answer:
+        smoothie = SmoothingFunction().method4
+        bleu_val = sentence_bleu([ref_answer.split()], pred_answer.split(), smoothing_function=smoothie)
+        bleu_scores.append(bleu_val)
+
+        rouge_res = rouge.compute(predictions=[pred_answer], references=[ref_answer])
+        rouge_scores.append(rouge_res["rougeL"])
+
+        pred_tokens = set(pred_answer.lower().split())
+        ref_tokens = set(ref_answer.lower().split())
+        common = len(pred_tokens & ref_tokens)
+        precision_scores.append(common / len(pred_tokens) if pred_tokens else 0)
+        recall_scores.append(common / len(ref_tokens) if ref_tokens else 0)
+
+results = squad_metric.compute(predictions=predictions, references=references)
+
+avg_bleu = np.mean(bleu_scores) * 100
+avg_rouge = np.mean(rouge_scores) * 100
+avg_precision = np.mean(precision_scores) * 100
+avg_recall = np.mean(recall_scores) * 100
+avg_f1_custom = 2 * (avg_precision * avg_recall) / (avg_precision + avg_recall + 1e-8)
+
+print("\nEvaluation Results:")
+print(f"Exact Match (EM): {results['exact_match']:.2f}")
+print(f"F1 Score (SQuAD): {results['f1']:.2f}")
+print(f"Precision: {avg_precision:.2f}")
+print(f"Recall: {avg_recall:.2f}")
+print(f"F1 (from P/R): {avg_f1_custom:.2f}")
+print(f"BLEU: {avg_bleu:.2f}")
+print(f"ROUGE-L: {avg_rouge:.2f}")
+
+# Interactive Query Section (top-3 retrieval)
+query = input("\nPlease enter your query. Type 'exit' or 'quit' to exit: ")
+while query.lower() not in ('exit', 'quit'):
+    result = db.query(query_texts=[query], n_results=TOP_K)
+    retrieved_passages = result["documents"][0] if result["documents"] else []
+    passages_joined = "\n\n".join([f"[Passage {i+1}]: {p}" for i, p in enumerate(retrieved_passages)])
+    prompt = f"""
+    You are an assistant that answers **only** using factual information from the passages below.
+    If the answer isn't present, say you don't know.
+    QUESTION: {query}
+    PASSAGES: {passages_joined}
+    """
+    answer = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+    print("\nAssistant:", answer.text)
+    query = input("\nPlease enter your query. Type 'exit' or 'quit' to exit: ")
